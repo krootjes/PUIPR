@@ -403,7 +403,7 @@ func (s *Server) fetchOnce(client *http.Client) {
 		log.Printf("ingest error: %v", err)
 		return
 	}
-	log.Printf("ingested %d items from Tautulli", len(items))
+	log.Printf("ingested %d items from Tautulli: %s", len(items), s.tautulliURL)
 }
 
 func (s *Server) fetchTautulli(client *http.Client) ([]TautulliItem, error) {

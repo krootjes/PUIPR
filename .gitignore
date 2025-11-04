@@ -6,6 +6,6 @@
 **/.DS_Store
 node_modules/
 /.vscode/
-
-# 🔒 secrets (do not commit)
 *.env
+*.gitignore
+*.gitattributes
