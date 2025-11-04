@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:18
+    container_name: puipr-postgres
+    environment:
+      POSTGRES_USER: pgadmin
+      POSTGRES_PASSWORD: pgadminpass
+      POSTGRES_DB: puiprdb
+      PGDATA: /var/lib/postgresql/18/docker
+    volumes:
+      - pgdata18:/var/lib/postgresql/18/docker
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: puipr-app
+    environment:
+      DATABASE_URL: postgres://puipr:puiprpass@postgres:5432/puiprdb?sslmode=disable
+      APP_ADDR: 0.0.0.0:8080
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  pgdata18:

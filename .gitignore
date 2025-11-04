@@ -1,0 +1,6 @@
+/app/puipr
+/app/coverage*.out
+pgdata18/
+**/.DS_Store
+node_modules/
+/.vscode/
