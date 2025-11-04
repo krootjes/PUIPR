@@ -7,5 +7,5 @@
 node_modules/
 /.vscode/
 *.env
-*.gitignore
-*.gitattributes
+.gitignore
+.gitattributes
