@@ -2,15 +2,13 @@
 FROM golang:1.22.7-alpine3.20 AS build
 WORKDIR /src
 
-# Go deps
 COPY go.mod ./
 RUN go mod download
 
-# App code
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/puipr
 
-# Run-stage (distroless, minimal)
+# Run-stage
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=build /out/puipr /app/puipr

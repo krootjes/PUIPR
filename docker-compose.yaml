@@ -4,12 +4,13 @@ services:
       context: ./app
       dockerfile: Dockerfile
     container_name: puipr-app
+    # 🔒 laad secrets uit file die niet in Git staat
+    env_file:
+      - ./secrets/puipr.env
+    # Publieke / niet-gevoelige envs blijven hier
     environment:
-      # Pad naar je SQLite database-bestand in de container
       APP_DB_PATH: /data/puipr.db
       APP_ADDR: 0.0.0.0:8080
-      # Optioneel: beveilig /ingest met token
-      # INGEST_TOKEN: supersecrettoken123
     volumes:
       - ./data:/data
     ports:

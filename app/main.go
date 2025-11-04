@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -25,6 +26,11 @@ var tplFS embed.FS
 type Server struct {
 	db  *sql.DB
 	tpl *template.Template
+	// fetcher config
+	tautulliURL    string
+	tautulliAPIKey string
+	tautulliLength int
+	fetchInterval  time.Duration
 }
 
 type TautulliItem struct {
@@ -57,32 +63,55 @@ func main() {
 
 	mustFileDir(dbPath)
 
-	// SQLite DSN met WAL en busy_timeout
+	// SQLite DSN met WAL + busy_timeout
 	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", dbPath)
-
-	// Open DB en zet pragmas
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1) // SQLite: single-writer
 
-	// Connection sanity
-	db.SetMaxOpenConns(1) // SQLite: single-writer, houd 't simpel
 	if err := pingRetry(db, 10, 300*time.Millisecond); err != nil {
 		log.Fatalf("db ping failed: %v", err)
 	}
-
-	// Schema
 	if err := ensureSchema(db); err != nil {
 		log.Fatal(err)
 	}
 
-	// Templates
 	tpl := template.Must(template.ParseFS(tplFS, "templates/*.html"))
-	s := &Server{db: db, tpl: tpl}
 
-	// Routes
+	// Fetcher config uit env
+	tURL := env("TAUTULLI_URL", "")
+	tKey := env("TAUTULLI_APIKEY", "")
+	lenStr := env("TAUTULLI_LENGTH", "100")
+	intervalStr := env("FETCH_INTERVAL", "5m")
+	tLen, _ := strconv.Atoi(lenStr)
+	if tLen <= 0 {
+		tLen = 100
+	}
+	itv, err := time.ParseDuration(intervalStr)
+	if err != nil || itv < time.Second {
+		itv = 5 * time.Minute
+	}
+
+	s := &Server{
+		db:             db,
+		tpl:            tpl,
+		tautulliURL:    tURL,
+		tautulliAPIKey: tKey,
+		tautulliLength: tLen,
+		fetchInterval:  itv,
+	}
+
+	// Start fetcher goroutine als geconfigureerd
+	if s.tautulliURL != "" && s.tautulliAPIKey != "" {
+		go s.runFetcher()
+		log.Printf("Fetcher enabled: %s every %s (length=%d)", s.tautulliURL, s.fetchInterval, s.tautulliLength)
+	} else {
+		log.Printf("Fetcher disabled (set TAUTULLI_URL and TAUTULLI_APIKEY to enable)")
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleHome)
 	mux.HandleFunc("/partial/summary", s.handleSummary)
@@ -138,7 +167,6 @@ CREATE TABLE IF NOT EXISTS user_ip_history (
 CREATE INDEX IF NOT EXISTS idx_user_ip_history_user_last
 ON user_ip_history (user_id, last_seen DESC);
 
--- Laatste IP per user (SQLite view)
 CREATE VIEW IF NOT EXISTS users_last_ip AS
 SELECT
   pu.id AS user_id,
@@ -278,7 +306,6 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// array OR {data:[...]}
 	var arr []TautulliItem
 	if err := json.Unmarshal(body, &arr); err != nil {
 		var obj struct {
@@ -296,28 +323,30 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
+	if err := s.ingestItems(r.Context(), arr); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(fmt.Sprintf(`{"ingested":%d}`, len(arr))))
+}
+
+func (s *Server) ingestItems(ctx context.Context, arr []TautulliItem) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
 	defer tx.Rollback()
 
-	now := time.Now().UTC()
-	nowStr := now.Format(time.RFC3339)
-
 	for _, it := range arr {
-		ts := now
+		ts := time.Now().UTC()
 		if it.Date != nil && *it.Date > 0 {
 			ts = time.Unix(*it.Date, 0).UTC()
 		}
 		tsStr := ts.Format(time.RFC3339)
 
 		// Upsert user
-		_, err = tx.Exec(`
+		if _, err := tx.Exec(`
 INSERT INTO plex_users (id, username, friendly_name, user_thumb, last_seen)
 VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
@@ -325,31 +354,95 @@ ON CONFLICT(id) DO UPDATE SET
   friendly_name=excluded.friendly_name,
   user_thumb=excluded.user_thumb,
   last_seen=CASE WHEN plex_users.last_seen > excluded.last_seen THEN plex_users.last_seen ELSE excluded.last_seen END
-`, it.UserID, it.User, it.FriendlyName, it.UserThumb, tsStr)
-		if err != nil {
-			http.Error(w, "user upsert: "+err.Error(), 500)
-			return
+`, it.UserID, it.User, it.FriendlyName, it.UserThumb, tsStr); err != nil {
+			return fmt.Errorf("user upsert: %w", err)
 		}
 
 		// Upsert IP
 		if it.IPAddress != nil && *it.IPAddress != "" {
-			_, err = tx.Exec(`
+			if _, err := tx.Exec(`
 INSERT INTO user_ip_history (user_id, ip, first_seen, last_seen)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(user_id, ip) DO UPDATE SET
   last_seen=CASE WHEN user_ip_history.last_seen > excluded.last_seen THEN user_ip_history.last_seen ELSE excluded.last_seen END
-`, it.UserID, *it.IPAddress, tsStr, tsStr)
-			if err != nil {
-				http.Error(w, "ip upsert: "+err.Error(), 500)
-				return
+`, it.UserID, *it.IPAddress, tsStr, tsStr); err != nil {
+				return fmt.Errorf("ip upsert: %w", err)
 			}
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		http.Error(w, err.Error(), 500)
+	return tx.Commit()
+}
+
+// ---------------- Fetcher (in-app) ----------------
+
+func (s *Server) runFetcher() {
+	client := &http.Client{Timeout: 15 * time.Second}
+
+	// run immediately, then on ticker
+	s.fetchOnce(client)
+	t := time.NewTicker(s.fetchInterval)
+	defer t.Stop()
+	for range t.C {
+		s.fetchOnce(client)
+	}
+}
+
+func (s *Server) fetchOnce(client *http.Client) {
+	items, err := s.fetchTautulli(client)
+	if err != nil {
+		log.Printf("fetch error: %v", err)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(fmt.Sprintf(`{"ingested":%d,"at":"%s"}`, len(arr), nowStr)))
+	if len(items) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := s.ingestItems(ctx, items); err != nil {
+		log.Printf("ingest error: %v", err)
+		return
+	}
+	log.Printf("ingested %d items from Tautulli", len(items))
+}
+
+func (s *Server) fetchTautulli(client *http.Client) ([]TautulliItem, error) {
+	u, err := url.Parse(s.tautulliURL)
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	q.Set("apikey", s.tautulliAPIKey)
+	q.Set("cmd", "get_history")
+	q.Set("length", strconv.Itoa(s.tautulliLength))
+	q.Set("order_column", "date")
+	q.Set("order_dir", "desc")
+	u.RawQuery = q.Encode()
+
+	req, _ := http.NewRequest(http.MethodGet, u.String(), nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("tautulli http %d: %s", resp.StatusCode, string(body))
+	}
+
+	var outer struct {
+		Response struct {
+			Result string `json:"result"`
+			Data   struct {
+				Data []TautulliItem `json:"data"`
+			} `json:"data"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(body, &outer); err != nil {
+		return nil, fmt.Errorf("unmarshal: %w", err)
+	}
+	if strings.ToLower(outer.Response.Result) != "success" {
+		return nil, fmt.Errorf("tautulli result: %s", outer.Response.Result)
+	}
+	return outer.Response.Data.Data, nil
 }
