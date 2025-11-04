@@ -1,6 +1,8 @@
 /app/puipr
 /app/coverage*.out
-pgdata18/
+/data/*.db
+/data/*.db-shm
+/data/*.db-wal
 **/.DS_Store
 node_modules/
 /.vscode/

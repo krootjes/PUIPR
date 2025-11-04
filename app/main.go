@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -10,18 +11,19 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	_ "modernc.org/sqlite"
 )
 
 //go:embed templates/*
 var tplFS embed.FS
 
 type Server struct {
-	db  *pgxpool.Pool
+	db  *sql.DB
 	tpl *template.Template
 }
 
@@ -34,45 +36,60 @@ type TautulliItem struct {
 	Date         *int64  `json:"date"`
 }
 
-func mustEnv(k string) string {
+func env(k, def string) string {
 	v := os.Getenv(k)
 	if v == "" {
-		log.Fatalf("missing env %s", k)
+		return def
 	}
 	return v
 }
 
-func main() {
-	dsn := mustEnv("DATABASE_URL")
-	addr := os.Getenv("APP_ADDR")
-	if addr == "" {
-		addr = "0.0.0.0:8080"
+func mustFileDir(p string) {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Fatalf("mkdir %s: %v", dir, err)
 	}
+}
 
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		log.Fatal(err)
-	}
-	db, err := pgxpool.NewWithConfig(context.Background(), cfg)
+func main() {
+	dbPath := env("APP_DB_PATH", "/data/puipr.db")
+	addr := env("APP_ADDR", "0.0.0.0:8080")
+
+	mustFileDir(dbPath)
+
+	// SQLite DSN met WAL en busy_timeout
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", dbPath)
+
+	// Open DB en zet pragmas
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	tpl := template.Must(template.ParseFS(tplFS, "templates/*.html"))
-	s := &Server{db: db, tpl: tpl}
+	// Connection sanity
+	db.SetMaxOpenConns(1) // SQLite: single-writer, houd 't simpel
+	if err := pingRetry(db, 10, 300*time.Millisecond); err != nil {
+		log.Fatalf("db ping failed: %v", err)
+	}
 
-	if err := s.ensureSchema(context.Background()); err != nil {
+	// Schema
+	if err := ensureSchema(db); err != nil {
 		log.Fatal(err)
 	}
 
+	// Templates
+	tpl := template.Must(template.ParseFS(tplFS, "templates/*.html"))
+	s := &Server{db: db, tpl: tpl}
+
+	// Routes
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleHome)
 	mux.HandleFunc("/partial/summary", s.handleSummary)
 	mux.HandleFunc("/partial/user/", s.handleUserIPs) // /partial/user/{id}
 	mux.HandleFunc("/ingest", s.handleIngest)         // POST (array or {data:[...]})
 
-	log.Printf("PUIPR listening on %s", addr)
+	log.Printf("PUIPR (SQLite) listening on %s (db: %s)", addr, dbPath)
 	log.Fatal(http.ListenAndServe(addr, logRequest(mux)))
 }
 
@@ -82,6 +99,69 @@ func logRequest(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
 	})
+}
+
+func pingRetry(db *sql.DB, tries int, backoff time.Duration) error {
+	var err error
+	for i := 1; i <= tries; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err = db.PingContext(ctx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		time.Sleep(backoff)
+	}
+	return err
+}
+
+func ensureSchema(db *sql.DB) error {
+	stmt := `
+CREATE TABLE IF NOT EXISTS plex_users (
+  id            INTEGER PRIMARY KEY,         -- user_id
+  username      TEXT NOT NULL,
+  friendly_name TEXT,
+  user_thumb    TEXT,
+  last_seen     TEXT NOT NULL                -- RFC3339
+);
+
+CREATE TABLE IF NOT EXISTS user_ip_history (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL,
+  ip         TEXT NOT NULL,
+  first_seen TEXT NOT NULL,
+  last_seen  TEXT NOT NULL,
+  CONSTRAINT uq_user_ip UNIQUE (user_id, ip),
+  FOREIGN KEY(user_id) REFERENCES plex_users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_ip_history_user_last
+ON user_ip_history (user_id, last_seen DESC);
+
+-- Laatste IP per user (SQLite view)
+CREATE VIEW IF NOT EXISTS users_last_ip AS
+SELECT
+  pu.id AS user_id,
+  pu.username,
+  pu.friendly_name,
+  (
+    SELECT uih.ip
+    FROM user_ip_history uih
+    WHERE uih.user_id = pu.id
+    ORDER BY uih.last_seen DESC
+    LIMIT 1
+  ) AS last_ip,
+  (
+    SELECT uih.last_seen
+    FROM user_ip_history uih
+    WHERE uih.user_id = pu.id
+    ORDER BY uih.last_seen DESC
+    LIMIT 1
+  ) AS updated_at
+FROM plex_users pu;
+`
+	_, err := db.Exec(stmt)
+	return err
 }
 
 func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
@@ -94,25 +174,29 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	sql := `
-SELECT pu.id AS user_id, pu.username, pu.friendly_name, uli.last_ip::text, uli.updated_at
+
+	sqlq := `
+SELECT pu.id, pu.username, pu.friendly_name, uli.last_ip, uli.updated_at
 FROM users_last_ip uli
 JOIN plex_users pu ON pu.id = uli.user_id
 `
+	args := []any{}
 	if q != "" {
-		esc := strings.ReplaceAll(q, "'", "''")
-		sql += "WHERE pu.username ILIKE '%" + esc + "%' OR COALESCE(uli.last_ip::text,'') ILIKE '%" + esc + "%' OR COALESCE(pu.friendly_name,'') ILIKE '%" + esc + "%'\n"
+		sqlq += "WHERE pu.username LIKE ? OR IFNULL(uli.last_ip,'') LIKE ? OR IFNULL(pu.friendly_name,'') LIKE ?\n"
+		p := "%" + q + "%"
+		args = append(args, p, p, p)
 	}
-	sql += "ORDER BY pu.username ASC"
+	sqlq += "ORDER BY pu.username ASC"
 
 	type Row struct {
 		UserID       int64
 		Username     string
 		FriendlyName *string
 		LastIP       *string
-		UpdatedAt    *time.Time
+		UpdatedAt    *string
 	}
-	rows, err := s.db.Query(r.Context(), sql)
+
+	rows, err := s.db.Query(sqlq, args...)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -140,20 +224,22 @@ func (s *Server) handleUserIPs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var username string
-	_ = s.db.QueryRow(r.Context(), `SELECT username FROM plex_users WHERE id=$1`, uid).Scan(&username)
+	_ = s.db.QueryRow(`SELECT username FROM plex_users WHERE id = ?`, uid).Scan(&username)
 	if username == "" {
 		username = fmt.Sprintf("User %d", uid)
 	}
 
 	type IPRow struct {
-		IP                  string
-		FirstSeen, LastSeen time.Time
+		IP        string
+		FirstSeen string
+		LastSeen  string
 	}
-	rows, err := s.db.Query(r.Context(), `
-SELECT ip::text, first_seen, last_seen
+	rows, err := s.db.Query(`
+SELECT ip, first_seen, last_seen
 FROM user_ip_history
-WHERE user_id=$1
-ORDER BY last_seen DESC`, uid)
+WHERE user_id = ?
+ORDER BY last_seen DESC
+`, uid)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -177,6 +263,14 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", 405)
 		return
 	}
+	// Optionele bearer token
+	want := os.Getenv("INGEST_TOKEN")
+	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if want != "" && got != want {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
 	if err != nil {
 		http.Error(w, err.Error(), 400)
@@ -190,7 +284,10 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		var obj struct {
 			Data []TautulliItem `json:"data"`
 		}
-		_ = json.Unmarshal(body, &obj)
+		if e2 := json.Unmarshal(body, &obj); e2 != nil {
+			http.Error(w, "bad json", 400)
+			return
+		}
 		arr = obj.Data
 	}
 	if len(arr) == 0 {
@@ -199,86 +296,60 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
-	tx, err := s.db.Begin(ctx)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 
 	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339)
+
 	for _, it := range arr {
 		ts := now
 		if it.Date != nil && *it.Date > 0 {
 			ts = time.Unix(*it.Date, 0).UTC()
 		}
+		tsStr := ts.Format(time.RFC3339)
 
-		_, err = tx.Exec(ctx, `
-INSERT INTO plex_users(id, username, friendly_name, user_thumb, last_seen)
-VALUES ($1,$2,$3,$4,$5)
-ON CONFLICT (id) DO UPDATE
-SET username=EXCLUDED.username,
-    friendly_name=EXCLUDED.friendly_name,
-    user_thumb=EXCLUDED.user_thumb,
-    last_seen=GREATEST(plex_users.last_seen, EXCLUDED.last_seen)
-`, it.UserID, it.User, it.FriendlyName, it.UserThumb, ts)
+		// Upsert user
+		_, err = tx.Exec(`
+INSERT INTO plex_users (id, username, friendly_name, user_thumb, last_seen)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  username=excluded.username,
+  friendly_name=excluded.friendly_name,
+  user_thumb=excluded.user_thumb,
+  last_seen=CASE WHEN plex_users.last_seen > excluded.last_seen THEN plex_users.last_seen ELSE excluded.last_seen END
+`, it.UserID, it.User, it.FriendlyName, it.UserThumb, tsStr)
 		if err != nil {
 			http.Error(w, "user upsert: "+err.Error(), 500)
 			return
 		}
 
+		// Upsert IP
 		if it.IPAddress != nil && *it.IPAddress != "" {
-			_, err = tx.Exec(ctx, `
-INSERT INTO user_ip_history(user_id, ip, first_seen, last_seen)
-VALUES ($1,$2,$3,$3)
-ON CONFLICT (user_id, ip) DO UPDATE
-SET last_seen = GREATEST(user_ip_history.last_seen, EXCLUDED.last_seen)
-`, it.UserID, *it.IPAddress, ts)
+			_, err = tx.Exec(`
+INSERT INTO user_ip_history (user_id, ip, first_seen, last_seen)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(user_id, ip) DO UPDATE SET
+  last_seen=CASE WHEN user_ip_history.last_seen > excluded.last_seen THEN user_ip_history.last_seen ELSE excluded.last_seen END
+`, it.UserID, *it.IPAddress, tsStr, tsStr)
 			if err != nil {
 				http.Error(w, "ip upsert: "+err.Error(), 500)
 				return
 			}
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+
+	if err := tx.Commit(); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(fmt.Sprintf(`{"ingested":%d}`, len(arr))))
-}
-
-func (s *Server) ensureSchema(ctx context.Context) error {
-	_, err := s.db.Exec(ctx, `
-CREATE TABLE IF NOT EXISTS plex_users (
-  id BIGINT PRIMARY KEY,
-  username TEXT NOT NULL,
-  friendly_name TEXT,
-  user_thumb TEXT,
-  last_seen TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS user_ip_history (
-  id BIGSERIAL PRIMARY KEY,
-  user_id BIGINT NOT NULL REFERENCES plex_users(id) ON DELETE CASCADE,
-  ip INET NOT NULL,
-  first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT uq_user_ip UNIQUE (user_id, ip)
-);
-CREATE OR REPLACE VIEW users_last_ip AS
-SELECT pu.id AS user_id,
-       pu.username,
-       pu.friendly_name,
-       (SELECT uih.ip FROM user_ip_history uih
-         WHERE uih.user_id = pu.id
-         ORDER BY uih.last_seen DESC
-         LIMIT 1) AS last_ip,
-       (SELECT uih.last_seen FROM user_ip_history uih
-         WHERE uih.user_id = pu.id
-         ORDER BY uih.last_seen DESC
-         LIMIT 1) AS updated_at
-FROM plex_users pu;
-`)
-	return err
+	w.Write([]byte(fmt.Sprintf(`{"ingested":%d,"at":"%s"}`, len(arr), nowStr)))
 }
