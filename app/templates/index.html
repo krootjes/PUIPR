@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>PUIPR — Plex User IP Registration</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    dialog { max-width: 720px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace; }
+    .clickable-row { cursor:pointer; }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <h1>PUIPR</h1>
+    <p class="muted">Overzicht van Plex users met laatste IP. Klik voor IP-historie.</p>
+
+    <article>
+      <header>
+        <form class="grid" hx-get="/partial/summary" hx-target="#summary" hx-trigger="load, submit" hx-swap="innerHTML">
+          <input name="q" type="search" placeholder="Filter op username of IP…" />
+          <button type="submit">Zoek</button>
+        </form>
+      </header>
+      <div id="summary" aria-busy="true">Laden…</div>
+    </article>
+  </main>
+
+  <dialog id="ipModal">
+    <article>
+      <header>
+        <a href="#close" aria-label="Close" class="close" onclick="document.getElementById('ipModal').close()"></a>
+        <h3 id="modalTitle">IP history</h3>
+      </header>
+      <div id="ipHistory" aria-busy="true">Laden…</div>
+      <footer>
+        <button onclick="document.getElementById('ipModal').close()">Sluiten</button>
+      </footer>
+    </article>
+  </dialog>
+
+  <script>
+    document.body.addEventListener('htmx:afterOnLoad', function (evt) {
+      if (evt.detail.requestConfig?.path?.startsWith('/partial/user/')) {
+        document.getElementById('ipModal').showModal();
+      }
+    });
+  </script>
+</body>
+</html>

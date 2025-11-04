@@ -1,0 +1,15 @@
+<table role="grid">
+  <thead><tr><th>IP</th><th>Eerste keer</th><th>Laatst gezien</th></tr></thead>
+  <tbody>
+    {{- if not .IPs }}
+    <tr><td colspan="3">Nog geen historie.</td></tr>
+    {{- end }}
+    {{- range .IPs }}
+    <tr>
+      <td class="mono">{{ .IP }}</td>
+      <td>{{ .FirstSeen }}</td>
+      <td>{{ .LastSeen }}</td>
+    </tr>
+    {{- end }}
+  </tbody>
+</table>
