@@ -8,5 +8,4 @@ node_modules/
 /.vscode/
 
 # 🔒 secrets (do not commit)
-secrets/
 *.env
