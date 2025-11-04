@@ -59,7 +59,7 @@ func mustFileDir(p string) {
 
 func main() {
 	dbPath := env("APP_DB_PATH", "/data/puipr.db")
-	addr := env("APP_ADDR", "0.0.0.0:8080")
+	addr := env("APP_ADDR", "0.0.0.0:1707")
 
 	mustFileDir(dbPath)
 

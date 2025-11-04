@@ -10,9 +10,9 @@ services:
     # Publieke / niet-gevoelige envs blijven hier
     environment:
       APP_DB_PATH: /data/puipr.db
-      APP_ADDR: 0.0.0.0:8080
+      APP_ADDR: 0.0.0.0:1707
     volumes:
       - ./data:/data
     ports:
-      - "8080:8080"
+      - "1707:1707"
     restart: unless-stopped
