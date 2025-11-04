@@ -12,7 +12,7 @@
         hx-target="#ipHistory"
         hx-swap="innerHTML"
         onclick="document.getElementById('modalTitle').textContent='{{ .Username }}'">
-      <td><strong>{{ .Username }}</strong>{{ if .FriendlyName }} <span class="badge">{{ .FriendlyName }}</span>{{ end }}</td>
+      <td><strong>{{ .Username }}</strong></td>
       <td class="mono">{{ if .LastIP }}{{ .LastIP }}{{ else }}—{{ end }}</td>
       <td>{{ if .UpdatedAt }}{{ .UpdatedAt }}{{ else }}—{{ end }}</td>
     </tr>
