@@ -1,5 +1,5 @@
 # Build-stage
-FROM golang:1.22.7-alpine3.20 AS build
+FROM golang:1.24-alpine3.20 AS build
 WORKDIR /src
 
 COPY go.mod ./
