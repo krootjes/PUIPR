@@ -42,6 +42,16 @@ type TautulliItem struct {
 	Date         *int64  `json:"date"`
 }
 
+type statusWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.code = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
 func env(k, def string) string {
 	v := os.Getenv(k)
 	if v == "" {
@@ -79,7 +89,18 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Custom tijdformatter: dd/mm/yyyy hh:mm
+	// Tijdzone instellen vanuit .env (geldt voor hele app)
+	tzName := os.Getenv("TZ")
+	if tzName == "" {
+		log.Fatal("missing required env: TZ")
+	}
+	loc, err := time.LoadLocation(tzName)
+	if err != nil {
+		log.Fatalf("invalid timezone %q: %v", tzName, err)
+	}
+	time.Local = loc
+
+	// Custom tijdformatter: dd/mm/yyyy hh:mm (gebruikt time.Local)
 	formatTime := func(ts string) string {
 		if ts == "" {
 			return ""
@@ -88,12 +109,13 @@ func main() {
 		if err != nil {
 			return ts
 		}
-		loc, _ := time.LoadLocation("Europe/Amsterdam") // lokale tijd
-		return t.In(loc).Format("02/01/2006 15:04")
+		return t.In(time.Local).Format("02/01/2006 15:04")
 	}
 
-	// Template met formatterfunctie
-	tpl := template.Must(template.New("").Funcs(template.FuncMap{"formatTime": formatTime}).ParseFS(tplFS, "templates/*.html"))
+	// Templates met formatterfunctie
+	tpl := template.Must(template.New("").Funcs(template.FuncMap{
+		"formatTime": formatTime,
+	}).ParseFS(tplFS, "templates/*.html"))
 
 	// Fetcher config uit env
 	tURL := env("TAUTULLI_URL", "")
@@ -139,9 +161,17 @@ func main() {
 func logRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		loc, _ := time.LoadLocation("Europe/Amsterdam")
-		log.Printf("[%s] %s %s (%v)", time.Now().In(loc).Format("02/01/2006 15:04"), r.Method, r.URL.Path, time.Since(start))
+
+		sw := &statusWriter{ResponseWriter: w, code: 200}
+		next.ServeHTTP(sw, r)
+
+		d := time.Since(start)
+		// minder spam: sla snelle partial-user requests over tenzij error
+		if strings.HasPrefix(r.URL.Path, "/partial/user/") && d < 50*time.Millisecond && sw.code < 400 {
+			return
+		}
+
+		log.Printf("[%s] %s %s %d (%v)", time.Now().Format("02/01/2006 15:04"), r.Method, r.URL.Path, sw.code, d)
 	})
 }
 
@@ -303,7 +333,7 @@ ORDER BY last_seen DESC
 
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", 405)
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
 	// Optionele bearer token
