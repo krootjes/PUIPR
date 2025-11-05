@@ -79,7 +79,21 @@ func main() {
 		log.Fatal(err)
 	}
 
-	tpl := template.Must(template.ParseFS(tplFS, "templates/*.html"))
+	// Custom tijdformatter: dd/mm/yyyy hh:mm
+	formatTime := func(ts string) string {
+		if ts == "" {
+			return ""
+		}
+		t, err := time.Parse(time.RFC3339, ts)
+		if err != nil {
+			return ts
+		}
+		loc, _ := time.LoadLocation("Europe/Amsterdam") // lokale tijd
+		return t.In(loc).Format("02/01/2006 15:04")
+	}
+
+	// Template met formatterfunctie
+	tpl := template.Must(template.New("").Funcs(template.FuncMap{"formatTime": formatTime}).ParseFS(tplFS, "templates/*.html"))
 
 	// Fetcher config uit env
 	tURL := env("TAUTULLI_URL", "")
@@ -126,7 +140,8 @@ func logRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
+		loc, _ := time.LoadLocation("Europe/Amsterdam")
+		log.Printf("[%s] %s %s (%v)", time.Now().In(loc).Format("02/01/2006 15:04"), r.Method, r.URL.Path, time.Since(start))
 	})
 }
 

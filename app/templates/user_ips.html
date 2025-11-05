@@ -7,8 +7,8 @@
     {{- range .IPs }}
     <tr>
       <td class="mono">{{ .IP }}</td>
-      <td>{{ .FirstSeen }}</td>
-      <td>{{ .LastSeen }}</td>
+      <td>{{ formatTime .FirstSeen }}</td>
+      <td>{{ formatTime .LastSeen }}</td>
     </tr>
     {{- end }}
   </tbody>
